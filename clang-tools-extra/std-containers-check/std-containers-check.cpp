@@ -25,22 +25,11 @@ namespace ClangVariables {
 
 constexpr llvm::StringRef Marker{"clang"};
 
-/// Callback class for clang-variable matches.
 class MatchHandler : public clang::ast_matchers::MatchFinder::MatchCallback {
 public:
   using MatchResult = clang::ast_matchers::MatchFinder::MatchResult;
 
-  /// Handles the matched variable.
-  ///
-  /// Checks if the name of the matched variable is either empty or prefixed
-  /// with `clang_` else emits a diagnostic and FixItHint.
   void run(const MatchResult &Result) override {
-    // for (const auto &[ID, Node] : Result.Nodes.getMap()) {
-    //   llvm::errs() << "Bound ID: " << ID << "\n";
-    //   Node.dump(llvm::errs(), *Result.Context);
-    //   llvm::errs() << "\n---\n";
-    // }
-
     llvm::StringRef Name;
     const clang::NamedDecl *Value = nullptr;
     if ((Value = Result.Nodes.getNodeAs<clang::VarDecl>(Marker))) {
@@ -55,14 +44,6 @@ public:
       Name = Value->getName();
     } else if ((Value = Result.Nodes.getNodeAs<clang::ParmVarDecl>(Marker))) {
       Name = Value->getName();
-      // } else if ((Value =
-      // Result.Nodes.getNodeAs<clang::NonTypeTemplateParmDecl>(
-      //                 Marker))) {
-      //   Name = Value->getName();
-      // } else if ((Value =
-      // Result.Nodes.getNodeAs<clang::TemplateTypeParmDecl>(
-      //                 Marker))) {
-      //   Name = Value->getName();
     } else {
       llvm::report_fatal_error(
           "Error: Matched node is neither VarDecl nor FieldDecl");
@@ -76,18 +57,26 @@ public:
         Engine.getCustomDiagID(clang::DiagnosticsEngine::Warning,
                                "clang variable must have 'clang_' prefix");
 
-    /// Hint to the user to prefix the variable with 'clang_'.
     const clang::FixItHint FixIt =
         clang::FixItHint::CreateInsertion(Value->getLocation(), "clang_");
 
     Engine.Report(Value->getLocation(), ID).AddFixItHint(FixIt);
+  }
+
+private:
+  void printMatches(const MatchResult &Result) {
+    for (const auto &[ID, Node] : Result.Nodes.getMap()) {
+      llvm::errs() << "Bound ID: " << ID << "\n";
+      Node.dump(llvm::errs(), *Result.Context);
+      llvm::errs() << "\n---\n";
+    }
   }
 }; // namespace ClangVariables
 
 /// Dispatches the ASTMatcher.
 class Consumer : public clang::ASTConsumer {
 public:
-  /// Creates the matcher for clang variables and dispatches it on the TU.
+  /// Creates the matcher and dispatches it on the TU.
   void HandleTranslationUnit(clang::ASTContext &Context) override {
     using namespace clang::ast_matchers; // NOLINT(build/namespaces)
 
@@ -201,17 +190,12 @@ public:
 } // namespace ClangVariables
 
 namespace {
-llvm::cl::OptionCategory ToolCategory("clang-variables options");
+llvm::cl::OptionCategory ToolCategory("std-containers-check options");
 
 llvm::cl::extrahelp MoreHelp(R"(
-  Finds all Const Lambdas, that take an Auto parameter, are declared Noexcept
-  and have a Goto statement inside, e.g.:
-
-  const auto lambda = [] (auto) noexcept {
-    bool done = true;
-    flip: done = !done;
-    if (!done) goto flip;
-  };
+  Looks for usages of standard containers in variables, member fields, typedef-s, arguments and so on.
+  Unless they are annotated with the special tag 'allow-std-containers', all such usages should be replaced
+  with the corresponding container from `src/Common/ContainersWithMemoryTracking.h`.
 )");
 
 llvm::cl::extrahelp
