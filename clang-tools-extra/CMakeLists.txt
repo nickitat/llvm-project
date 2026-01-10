@@ -51,4 +51,4 @@ if(CLANG_INCLUDE_TESTS)
   umbrella_lit_testsuite_end(check-clang-tools)
 endif()
 
-add_subdirectory(clang-variables)
+add_subdirectory(std-containers-check)

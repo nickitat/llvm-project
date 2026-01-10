@@ -2,14 +2,14 @@ set(LLVM_LINK_COMPONENTS
   Support
 )
 
-add_clang_tool(clang-variables
-  clang-variables.cpp
+add_clang_tool(std-containers-check
+  std-containers-check.cpp
 
   DEPENDS
   ClangDriverOptions
 )
 
-clang_target_link_libraries(clang-variables
+clang_target_link_libraries(std-containers-check
   PRIVATE
   clangAST
   clangASTMatchers
