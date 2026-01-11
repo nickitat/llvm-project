@@ -2,6 +2,10 @@
 
 namespace ns {
 
+///
+/// Negative cases without 'allow-std-containers' annotation.
+///
+
 using Vec = std::vector<int>;
 
 typedef std::vector<int> OldStyleVec;
@@ -34,5 +38,21 @@ void test3() {
 
   f(std::vector{1.0f, 2.0f, 3.0f});
 }
+
+///
+/// Positive cases with 'allow-std-containers' annotation.
+///
+
+void test4() {
+  [[maybe_unused]] const std::vector<int> *v; // pls allow-std-containers
+}
+
+void test4(const std::vector<float> *v) // allow-std-containers
+{}
+
+void test4(int a, char b,
+           float f,                      //
+           const std::vector<double> &v, // allow-std-containers
+           double d) {}
 
 } // namespace ns

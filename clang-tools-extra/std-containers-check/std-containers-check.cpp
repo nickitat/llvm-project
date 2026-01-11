@@ -92,8 +92,7 @@ static CharSourceRange getSourceRange(const MatchResult &Result,
   const auto MatchBeginLoc = Value.getBeginLoc();
   const auto MatchBeginLine = SM.getPresumedLoc(MatchBeginLoc).getLine();
   const auto FileID = SM.getFileID(MatchBeginLoc);
-  const auto SearchBeginLoc =
-      SM.translateLineCol(FileID, MatchBeginLine - 1, 1);
+  const auto SearchBeginLoc = SM.translateLineCol(FileID, MatchBeginLine, 1);
   const auto MatchEndLine = SM.getPresumedLoc(Value.getEndLoc()).getLine();
   auto SearchEndLoc = SM.translateLineCol(FileID, MatchEndLine + 1, 1);
   if (SearchEndLoc.isValid()) {
