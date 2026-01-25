@@ -4,7 +4,7 @@
 ; Test demonstrating type-based devirtualization gap.
 ;
 ; Case 1 (g): Copy constructor visible - vtable store visible - DOES devirtualize
-; Case 2 (h): Parameter of known type - no vtable store visible - does NOT devirtualize
+; Case 2 (h): Parameter of known type - no vtable store visible - DOES devirtualize
 ;
 
 ; C++ source code:
@@ -57,10 +57,9 @@ entry:
   ret void
 }
 
-; Case 2: Parameter of known type - does NOT optimize
-; This demonstrates the missing type-based devirtualization optimization.
+; Case 2: Parameter of known type - DOES optimize
 ; The parameter has C++ type "Impl" (a final class), so the vtable MUST be @_ZTV4Impl,
-; but LLVM doesn't use this type information for devirtualization.
+; but LLVM previosly didn't use this type information for devirtualization.
 define dso_local void @_Z1h4Impl(ptr noundef %impl) {
 ; CHECK-LABEL: define dso_local void @_Z1h4Impl(
 ; CHECK-SAME: ptr noundef [[IMPL:%.*]]) {
@@ -69,19 +68,12 @@ define dso_local void @_Z1h4Impl(ptr noundef %impl) {
 ; CHECK-NEXT:    store i32 [[TMP0]], ptr @glob, align 4
 ; CHECK-NEXT:    ret void
 ;
-; When type-based devirtualization is implemented, this should optimize to:
-; FUTURE-CHECK-LABEL: define dso_local void @_Z1h4Impl(
-; FUTURE-CHECK-SAME: ptr noundef [[IMPL:%.*]]) {
-; FUTURE-CHECK-NEXT:  entry:
-; FUTURE-CHECK-NEXT:    [[TMP0:%.*]] = load i32, ptr @secretValue, align 4
-; FUTURE-CHECK-NEXT:    store i32 [[TMP0]], ptr @glob, align 4
-; FUTURE-CHECK-NEXT:    ret void
 entry:
   call void @_ZN4Intf3fooEv(ptr noundef nonnull align 8 dereferenceable(8) %impl)
   ret void
 }
 
-; Helper: Copy constructor (sets vtable)
+; Copy constructor (sets vtable)
 define linkonce_odr void @_ZN4ImplC2ERKS_(ptr noundef nonnull align 8 dereferenceable(8) %this, ptr noundef nonnull align 8 dereferenceable(8) %0) unnamed_addr align 2 {
 entry:
   call void @_ZN4IntfC2ERKS_(ptr noundef nonnull align 8 dereferenceable(8) %this, ptr noundef nonnull align 8 dereferenceable(8) %0)
@@ -89,13 +81,13 @@ entry:
   ret void
 }
 
-; Helper: Base copy constructor
+; Base copy constructor
 define linkonce_odr void @_ZN4IntfC2ERKS_(ptr noundef nonnull align 8 dereferenceable(8) %this, ptr noundef nonnull align 8 dereferenceable(8) %0) unnamed_addr align 2 {
 entry:
   ret void
 }
 
-; Helper: foo() with virtual call
+; foo() with virtual call
 define linkonce_odr void @_ZN4Intf3fooEv(ptr noundef nonnull align 8 dereferenceable(8) %this) align 2 {
 entry:
   %vtable = load ptr, ptr %this, align 8
@@ -105,7 +97,7 @@ entry:
   ret void
 }
 
-; Helper: Impl::doFoo()
+; Impl::doFoo()
 define linkonce_odr void @_ZN4Impl5doFooEv(ptr noundef nonnull align 8 dereferenceable(8) %this) unnamed_addr align 2 {
 ; CHECK-LABEL: define linkonce_odr void @_ZN4Impl5doFooEv(
 ; CHECK-SAME: ptr noundef nonnull align 8 dereferenceable(8) [[THIS:%.*]]) unnamed_addr align 2 {
