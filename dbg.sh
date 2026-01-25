@@ -1,13 +1,22 @@
 #!/usr/bin/sh
 
-# inline,instcombine,gvn,simplifycfg,inline
-# -mllvm -stats \
+# -mllvm -debug \
+# -mllvm -print-after-all \
+# -mllvm -print-before-all \
 ./build_dbg/bin/clang++ -O2 inline.cc -o inline.out \
+  -mllvm -debug \
   -mllvm -debug-only=inline,inline-cost,module-inline,cgscc \
-  -mllvm -print-after=inline \
-  -mllvm -print-before=inline \
+  -mllvm -print-after=gvn \
+  -mllvm -print-before=gvn \
+  -mllvm -print-after=tbaa \
+  -mllvm -print-before=tbaa \
   -Rpass=inline \
   -Rpass-missed=inline \
   -Rpass-analysis=inline \
+  -Rpass=devirt \
+  -Rpass-missed=devirt \
+  -Rpass-analysis=devirt \
+  -Rpass=gvn \
+  -Rpass=tbaa \
   -S -emit-llvm \
-  2>&1 | c++filt | tee complete_inline_info.txt
+  2>&1 | c++filt | tee complete_inline_devirt_info.txt

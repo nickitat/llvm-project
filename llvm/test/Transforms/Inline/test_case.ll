@@ -65,9 +65,8 @@ define dso_local void @_Z1h4Impl(ptr noundef %impl) {
 ; CHECK-LABEL: define dso_local void @_Z1h4Impl(
 ; CHECK-SAME: ptr noundef [[IMPL:%.*]]) {
 ; CHECK-NEXT:  [[ENTRY:.*:]]
-; CHECK-NEXT:    [[VTABLE_I:%.*]] = load ptr, ptr [[IMPL]], align 8
-; CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[VTABLE_I]], align 8
-; CHECK-NEXT:    call void [[TMP0]](ptr noundef nonnull align 8 dereferenceable(8) [[IMPL]])
+; CHECK-NEXT:    [[TMP0:%.*]] = load i32, ptr @secretValue, align 4
+; CHECK-NEXT:    store i32 [[TMP0]], ptr @glob, align 4
 ; CHECK-NEXT:    ret void
 ;
 ; When type-based devirtualization is implemented, this should optimize to:

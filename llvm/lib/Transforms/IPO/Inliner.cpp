@@ -333,6 +333,8 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
       const int InlineHistoryID = P.second;
       Function &Callee = *CB->getCalledFunction();
 
+      dbgs() << "  Considering call to: " << Callee.getName() << "\n";
+
       if (InlineHistoryID != -1 &&
           inlineHistoryIncludes(&Callee, InlineHistoryID, InlineHistory)) {
         LLVM_DEBUG(dbgs() << "Skipping inlining due to history: " << F.getName()
@@ -362,10 +364,14 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
           Advisor.getAdvice(*CB, OnlyMandatory);
 
       // Check whether we want to inline this callsite.
-      if (!Advice)
+      if (!Advice) {
+        dbgs() << "__PRETTY_FUNCTION__: " << __PRETTY_FUNCTION__
+               << " __LINE__:" << __LINE__ << "\n";
         continue;
+      }
 
       if (!Advice->isInliningRecommended()) {
+        dbgs() << __PRETTY_FUNCTION__ << ":" << __LINE__ << "\n";
         Advice->recordUnattemptedInlining();
         continue;
       }
@@ -387,6 +393,8 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
           &FAM.getResult<AAManager>(*CB->getCaller()), true, nullptr,
           &FAM.getResult<OptimizationRemarkEmitterAnalysis>(*CB->getCaller()));
       if (!IR.isSuccess()) {
+        dbgs() << "__PRETTY_FUNCTION__: " << __PRETTY_FUNCTION__
+               << " __LINE__:" << __LINE__ << "\n";
         Advice->recordUnsuccessfulInlining(IR);
         continue;
       }
