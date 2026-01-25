@@ -259,7 +259,7 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
     // Instead we should do an actual RPO walk of the function body.
     for (Instruction &I : instructions(N.getFunction()))
       if (auto *CB = dyn_cast<CallBase>(&I))
-        if (Function *Callee = CB->getCalledFunction()) {
+        if (Function *Callee = CB->getCalledFunction()) { // nullptr will be returned here for our (perceived as) indirect call
           if (!Callee->isDeclaration())
             Calls.push_back({CB, -1});
           else if (!isa<IntrinsicInst>(I)) {
@@ -415,8 +415,12 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
             // the post-inline cleanup and the next DevirtSCCRepeatedPass
             // iteration because the next iteration may not happen and we may
             // miss inlining it.
-            if (tryPromoteCall(*ICB))
+            if (tryPromoteCall(*ICB)) {
+              dbgs() << "    Promoted indirect call site after inlining:" << *ICB << "\n";
               NewCallee = ICB->getCalledFunction();
+            } else {
+              dbgs() << "    Indirect call site remains after inlining:" << *ICB << "\n";
+            }
           }
           if (NewCallee) {
             if (!NewCallee->isDeclaration()) {
