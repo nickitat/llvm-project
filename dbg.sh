@@ -3,7 +3,7 @@
 # -mllvm -debug \
 # -mllvm -print-after-all \
 # -mllvm -print-before-all \
-./build_dbg/bin/clang++ -O2 inline.cc -o inline.out \
+./build_dbg/bin/clang++ -g -O2 inline.cc -o inline.out \
   -mllvm -debug \
   -mllvm -debug-only=inline,inline-cost,module-inline,cgscc \
   -mllvm -print-after=gvn \

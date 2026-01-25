@@ -15,6 +15,7 @@
 #include "llvm/Analysis/CtxProfAnalysis.h"
 #include "llvm/Analysis/Loads.h"
 #include "llvm/Analysis/TypeMetadataUtils.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/IRBuilder.h"
@@ -23,6 +24,9 @@
 #include "llvm/IR/Module.h"
 #include "llvm/ProfileData/PGOCtxProfReader.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 
 using namespace llvm;
 
@@ -682,6 +686,112 @@ CallBase &llvm::promoteCallWithVTableCmp(CallBase &CB, Instruction *VPtr,
   return promoteCall(NewInst, Callee);
 }
 
+// Get the DIType for a function argument from debug metadata
+static DIType *getArgumentDIType(Argument *Arg) {
+  Function *F = Arg->getParent();
+
+  // Get function's debug info
+  DISubprogram *SP = F->getSubprogram();
+  if (!SP) {
+    LLVM_DEBUG(dbgs() << "      No debug info for function\n");
+    return nullptr;
+  }
+
+  LLVM_DEBUG(dbgs() << "      Function has debug info: " << SP->getName()
+                    << "\n");
+
+  unsigned ArgNo = Arg->getArgNo();
+  LLVM_DEBUG(dbgs() << "      Looking for argument #" << ArgNo << "\n");
+
+  // Iterate through retained nodes to find this parameter
+  for (const DINode *Node : SP->getRetainedNodes()) {
+    if (auto *LocalVar = dyn_cast<DILocalVariable>(Node)) {
+      // Check if this is a parameter (not a local variable)
+      if (LocalVar->isParameter()) {
+        LLVM_DEBUG(dbgs() << "        Found parameter: " << LocalVar->getName()
+                          << " (arg " << (LocalVar->getArg() - 1) << ")\n");
+
+        // Match by argument number (DILocalVariable arg is 1-based)
+        if (LocalVar->getArg() - 1 == ArgNo) {
+          DIType *Ty = LocalVar->getType();
+          LLVM_DEBUG(dbgs() << "        Type: " << *Ty << "\n");
+          return Ty;
+        }
+      }
+    }
+  }
+
+  LLVM_DEBUG(dbgs() << "      Could not find debug info for this argument\n");
+  return nullptr;
+}
+
+// Get the actual struct/class type, stripping pointers and references
+static DICompositeType *getUnderlyingCompositeType(DIType *Ty) {
+  // Strip pointer/reference types
+  while (Ty) {
+    if (auto *DerivedTy = dyn_cast<DIDerivedType>(Ty)) {
+      unsigned Tag = DerivedTy->getTag();
+      if (Tag == dwarf::DW_TAG_pointer_type ||
+          Tag == dwarf::DW_TAG_reference_type ||
+          Tag == dwarf::DW_TAG_rvalue_reference_type) {
+        Ty = DerivedTy->getBaseType();
+        continue;
+      }
+    }
+
+    if (auto *CompositeTy = dyn_cast<DICompositeType>(Ty)) {
+      return CompositeTy;
+    }
+
+    break;
+  }
+
+  return nullptr;
+}
+
+// Check if a class type is final
+// static bool isClassFinal(DICompositeType *Ty) {
+//   // In C++, a class marked 'final' has the DIFlagFinal flag
+//   // However, note that Clang might not always emit this flag
+//   // For now, we'll be conservative and check for the flag
+//
+//   if (Ty->getFlags() & DINode::FlagFinal) {
+//     LLVM_DEBUG(dbgs() << "        Class is marked final\n");
+//     return true;
+//   }
+//
+//   // TODO: Could also check if there are any derived classes in the module
+//   // For now, return false if not explicitly marked
+//   LLVM_DEBUG(dbgs() << "        Class is not marked final\n");
+//   return false;
+// }
+
+// Get vtable name from type identifier
+static std::string getVTableNameFromDIType(DICompositeType *Ty) {
+  // Method 1: Use the identifier if present
+  if (StringRef Identifier = Ty->getIdentifier(); !Identifier.empty()) {
+    // Identifier is like "_ZTS4Impl"
+    // Vtable name is "_ZTV4Impl"
+    if (Identifier.starts_with("_ZTS")) {
+      std::string VTableName = "_ZTV" + Identifier.substr(4).str();
+      LLVM_DEBUG(dbgs() << "        Vtable from identifier: " << VTableName
+                        << "\n");
+      return VTableName;
+    }
+  }
+
+  // Method 2: Construct from type name
+  StringRef TypeName = Ty->getName();
+  if (!TypeName.empty()) {
+    std::string VTableName =
+        "_ZTV" + std::to_string(TypeName.size()) + TypeName.str();
+    LLVM_DEBUG(dbgs() << "        Vtable from name: " << VTableName << "\n");
+    return VTableName;
+  }
+
+  return "";
+}
+
 bool llvm::tryPromoteCall(CallBase &CB) {
   assert(!CB.getCalledFunction());
   Module *M = CB.getCaller()->getParent();
@@ -726,40 +836,63 @@ bool llvm::tryPromoteCall(CallBase &CB) {
     errs()
         << "    Object is argument, attempting type-based devirtualization\n";
 
-    // HARDCODED: Just look for the Impl vtable directly
-    GlobalVariable *ImplVTable = M->getGlobalVariable("_ZTV4Impl");
+    Argument *Arg = cast<Argument>(ObjectBase);
 
-    if (!ImplVTable) {
-      errs() << "    Could not find _ZTV4Impl vtable\n";
+    // Get debug type information for this argument
+    DIType *ArgDIType = getArgumentDIType(Arg);
+    if (!ArgDIType) {
+      errs() << "      No debug type information available\n";
       return false;
     }
 
-    errs() << "    Found Impl vtable: " << ImplVTable->getName() << "\n";
-
-    if (!ImplVTable->isConstant() || !ImplVTable->hasDefinitiveInitializer()) {
-      errs() << "    Vtable is not constant or has no initializer\n";
+    // Get the underlying class/struct type
+    DICompositeType *ClassType = getUnderlyingCompositeType(ArgDIType);
+    if (!ClassType) {
+      errs() << "      Argument is not a class/struct type\n";
       return false;
     }
 
-    // Get pointer to first virtual function in vtable
-    // Vtable layout: { [3 x ptr] } containing [null, typeinfo, function]
-    // We need to get a pointer to element [0][2] (the function pointer)
+    errs() << "      Class type: " << ClassType->getName() << "\n";
 
-    // Create GEP: getelementptr inbounds vtable, 0, 0, 2
-    Type *VTableType = ImplVTable->getValueType();
+    // Check if it's a final class (for safety)
+    // NOTE: For now, we proceed even if not marked final
+    // In production, you might want to require this
+    // bool IsFinal = isClassFinal(ClassType);
+    // errs() << "      Is final: " << (IsFinal ? "yes" : "no") << "\n";
+
+    // Get the vtable name
+    std::string VTableName = getVTableNameFromDIType(ClassType);
+    if (VTableName.empty()) {
+      errs() << "      Could not determine vtable name\n";
+      return false;
+    }
+
+    errs() << "      Looking for vtable: " << VTableName << "\n";
+
+    GlobalVariable *TypeVTable = M->getGlobalVariable(VTableName);
+    if (!TypeVTable) {
+      errs() << "      Vtable not found\n";
+      return false;
+    }
+
+    errs() << "      Found vtable: " << TypeVTable->getName() << "\n";
+
+    if (!TypeVTable->isConstant() || !TypeVTable->hasDefinitiveInitializer()) {
+      errs() << "      Vtable is not constant or has no initializer\n";
+      return false;
+    }
+
+    // Create pointer to vtable entry
+    Type *VTableType = TypeVTable->getValueType();
     Constant *Indices[] = {
-        ConstantInt::get(Type::getInt64Ty(M->getContext()),
-                         0), // First index: into the struct
-        ConstantInt::get(Type::getInt32Ty(M->getContext()),
-                         0), // Second: into the array
-        ConstantInt::get(Type::getInt32Ty(M->getContext()),
-                         2) // Third: skip null and typeinfo
-    };
+        ConstantInt::get(Type::getInt64Ty(M->getContext()), 0),
+        ConstantInt::get(Type::getInt32Ty(M->getContext()), 0),
+        ConstantInt::get(Type::getInt32Ty(M->getContext()), 2)};
 
     VTablePtr =
-        ConstantExpr::getInBoundsGetElementPtr(VTableType, ImplVTable, Indices);
+        ConstantExpr::getInBoundsGetElementPtr(VTableType, TypeVTable, Indices);
 
-    errs() << "    VTablePtr: " << *VTablePtr << "\n";
+    errs() << "      VTablePtr: " << *VTablePtr << "\n";
 
   } else {
     // Neither alloca nor argument
