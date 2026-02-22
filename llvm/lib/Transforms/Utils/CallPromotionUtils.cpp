@@ -15,18 +15,15 @@
 #include "llvm/Analysis/CtxProfAnalysis.h"
 #include "llvm/Analysis/Loads.h"
 #include "llvm/Analysis/TypeMetadataUtils.h"
-#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/Constant.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/ProfileData/PGOCtxProfReader.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
-
-#include "llvm/IR/DebugInfo.h"
-#include "llvm/IR/DebugInfoMetadata.h"
 
 using namespace llvm;
 
@@ -686,110 +683,112 @@ CallBase &llvm::promoteCallWithVTableCmp(CallBase &CB, Instruction *VPtr,
   return promoteCall(NewInst, Callee);
 }
 
-// Get the DIType for a function argument from debug metadata
-static DIType *getArgumentDIType(Argument *Arg) {
-  Function *F = Arg->getParent();
+// Try to devirtualize an indirect virtual call using llvm.type.test + llvm.assume
+// pairs that were emitted by Clang at static_cast<Derived*> downcast sites.
+//
+// The idea: static_cast<Derived*>(base) is a programmer assertion (UB if wrong)
+// that the object is of type Derived. Clang records this as:
+//   %tt = call i1 @llvm.type.test(ptr %base_obj, metadata !"_ZTS4Derived")
+//   call void @llvm.assume(i1 %tt)
+//
+// After the callee is inlined into the caller, the vtable is loaded from the
+// same object pointer (%base_obj). By scanning uses of Object (the vtable-load
+// source) for such type.test calls, we can determine the concrete vtable and
+// resolve the virtual call to a direct call — without needing GVN first.
+//
+// For the vtable lookup we prefer the precise offset from !type metadata on the
+// vtable global. When that metadata is absent we fall back to the Itanium ABI
+// convention: the vptr address-point is 2 pointers (16 bytes on 64-bit) past
+// the start of the vtable global.
+static bool tryDevirtualizeViaTypeTest(CallBase &CB, Value *Object,
+                                       APInt VTableOffset,
+                                       const DataLayout &DL, Module &M) {
+  // Build a dominator tree so we can verify the assume dominates the call.
+  DominatorTree DT(*CB.getFunction());
 
-  // Get function's debug info
-  DISubprogram *SP = F->getSubprogram();
-  if (!SP) {
-    LLVM_DEBUG(dbgs() << "      No debug info for function\n");
-    return nullptr;
-  }
+  for (User *U : Object->users()) {
+    auto *TypeTestCI = dyn_cast<CallInst>(U);
+    if (!TypeTestCI || TypeTestCI->getIntrinsicID() != Intrinsic::type_test)
+      continue;
+    // The type.test must use Object as its pointer argument.
+    if (TypeTestCI->getArgOperand(0) != Object)
+      continue;
 
-  LLVM_DEBUG(dbgs() << "      Function has debug info: " << SP->getName()
-                    << "\n");
+    // There must be a dominating llvm.assume consuming the type.test result.
+    bool HasDominatingAssume = false;
+    for (User *TU : TypeTestCI->users()) {
+      if (auto *Assume = dyn_cast<AssumeInst>(TU);
+          Assume && DT.dominates(Assume, &CB)) {
+        HasDominatingAssume = true;
+        break;
+      }
+    }
+    if (!HasDominatingAssume)
+      continue;
 
-  unsigned ArgNo = Arg->getArgNo();
-  LLVM_DEBUG(dbgs() << "      Looking for argument #" << ArgNo << "\n");
+    // Extract the type metadata identifier, e.g. MDString "_ZTS4Impl".
+    Metadata *TypeId =
+        cast<MetadataAsValue>(TypeTestCI->getArgOperand(1))->getMetadata();
 
-  // Iterate through retained nodes to find this parameter
-  for (const DINode *Node : SP->getRetainedNodes()) {
-    if (auto *LocalVar = dyn_cast<DILocalVariable>(Node)) {
-      // Check if this is a parameter (not a local variable)
-      if (LocalVar->isParameter()) {
-        LLVM_DEBUG(dbgs() << "        Found parameter: " << LocalVar->getName()
-                          << " (arg " << (LocalVar->getArg() - 1) << ")\n");
-
-        // Match by argument number (DILocalVariable arg is 1-based)
-        if (LocalVar->getArg() - 1 == ArgNo) {
-          DIType *Ty = LocalVar->getType();
-          LLVM_DEBUG(dbgs() << "        Type: " << *Ty << "\n");
-          return Ty;
+    // --- Vtable lookup via !type metadata (preferred) ---
+    // If the vtable global has !type metadata we can get the precise
+    // address-point offset, which is needed for the total offset computation.
+    for (GlobalVariable &GV : M.globals()) {
+      if (!GV.isConstant() || !GV.hasDefinitiveInitializer())
+        continue;
+      SmallVector<MDNode *, 2> Types;
+      GV.getMetadata(LLVMContext::MD_type, Types);
+      for (MDNode *TypeMD : Types) {
+        if (TypeMD->getNumOperands() < 2)
+          continue;
+        if (TypeMD->getOperand(1).get() != TypeId)
+          continue;
+        // Metadata operand 0 is the byte offset of the address point within GV.
+        auto *OffsetCmd =
+            dyn_cast<ConstantAsMetadata>(TypeMD->getOperand(0));
+        if (!OffsetCmd)
+          continue;
+        uint64_t AddrPointOffset =
+            cast<ConstantInt>(OffsetCmd->getValue())->getZExtValue();
+        if (VTableOffset.getActiveBits() > 64)
+          continue;
+        uint64_t TotalOffset = AddrPointOffset + VTableOffset.getZExtValue();
+        auto [DirectCallee, DirectCalleePtr] =
+            getFunctionAtVTableOffset(&GV, TotalOffset, M);
+        if (DirectCallee && isLegalToPromote(CB, DirectCallee)) {
+          promoteCall(CB, DirectCallee);
+          return true;
         }
       }
     }
-  }
 
-  LLVM_DEBUG(dbgs() << "      Could not find debug info for this argument\n");
-  return nullptr;
-}
-
-// Get the actual struct/class type, stripping pointers and references
-static DICompositeType *getUnderlyingCompositeType(DIType *Ty) {
-  // Strip pointer/reference types
-  while (Ty) {
-    if (auto *DerivedTy = dyn_cast<DIDerivedType>(Ty)) {
-      unsigned Tag = DerivedTy->getTag();
-      if (Tag == dwarf::DW_TAG_pointer_type ||
-          Tag == dwarf::DW_TAG_reference_type ||
-          Tag == dwarf::DW_TAG_rvalue_reference_type) {
-        Ty = DerivedTy->getBaseType();
-        continue;
-      }
-    }
-
-    if (auto *CompositeTy = dyn_cast<DICompositeType>(Ty)) {
-      return CompositeTy;
-    }
-
-    break;
-  }
-
-  return nullptr;
-}
-
-// Check if a class type is final
-// static bool isClassFinal(DICompositeType *Ty) {
-//   // In C++, a class marked 'final' has the DIFlagFinal flag
-//   // However, note that Clang might not always emit this flag
-//   // For now, we'll be conservative and check for the flag
-//
-//   if (Ty->getFlags() & DINode::FlagFinal) {
-//     LLVM_DEBUG(dbgs() << "        Class is marked final\n");
-//     return true;
-//   }
-//
-//   // TODO: Could also check if there are any derived classes in the module
-//   // For now, return false if not explicitly marked
-//   LLVM_DEBUG(dbgs() << "        Class is not marked final\n");
-//   return false;
-// }
-
-// Get vtable name from type identifier
-static std::string getVTableNameFromDIType(DICompositeType *Ty) {
-  // Method 1: Use the identifier if present
-  if (StringRef Identifier = Ty->getIdentifier(); !Identifier.empty()) {
-    // Identifier is like "_ZTS4Impl"
-    // Vtable name is "_ZTV4Impl"
-    if (Identifier.starts_with("_ZTS")) {
-      std::string VTableName = "_ZTV" + Identifier.substr(4).str();
-      LLVM_DEBUG(dbgs() << "        Vtable from identifier: " << VTableName
-                        << "\n");
-      return VTableName;
+    // --- Fallback: Itanium ABI name construction ---
+    // For "_ZTS4Impl" -> "_ZTV4Impl" (replace _ZTS prefix with _ZTV).
+    // The vptr address-point is assumed to be 2 pointers past the global start.
+    auto *MDStr = dyn_cast<MDString>(TypeId);
+    if (!MDStr)
+      continue;
+    StringRef TypeIdStr = MDStr->getString();
+    if (!TypeIdStr.starts_with("_ZTS"))
+      continue;
+    std::string VTableName = "_ZTV" + TypeIdStr.substr(4).str();
+    GlobalVariable *VTableGV = M.getGlobalVariable(VTableName);
+    if (!VTableGV || !VTableGV->isConstant() ||
+        !VTableGV->hasDefinitiveInitializer())
+      continue;
+    // Itanium ABI: vptr -> &vtable[2] (past offset-to-top and RTTI pointer).
+    uint64_t AddrPointOffset = 2 * DL.getPointerSize();
+    if (VTableOffset.getActiveBits() > 64)
+      continue;
+    uint64_t TotalOffset = AddrPointOffset + VTableOffset.getZExtValue();
+    auto [DirectCallee, DirectCalleePtr] =
+        getFunctionAtVTableOffset(VTableGV, TotalOffset, M);
+    if (DirectCallee && isLegalToPromote(CB, DirectCallee)) {
+      promoteCall(CB, DirectCallee);
+      return true;
     }
   }
-
-  // Method 2: Construct from type name
-  StringRef TypeName = Ty->getName();
-  if (!TypeName.empty()) {
-    std::string VTableName =
-        "_ZTV" + std::to_string(TypeName.size()) + TypeName.str();
-    LLVM_DEBUG(dbgs() << "        Vtable from name: " << VTableName << "\n");
-    return VTableName;
-  }
-
-  return "";
+  return false;
 }
 
 bool llvm::tryPromoteCall(CallBase &CB) {
@@ -798,6 +797,13 @@ bool llvm::tryPromoteCall(CallBase &CB) {
   const DataLayout &DL = M->getDataLayout();
   Value *Callee = CB.getCalledOperand();
 
+  // We expect the indirect callee to be a function pointer loaded from a vtable
+  // slot, which is itself a GEP into the vtable, which is loaded from the
+  // object's vptr field.  The chain is:
+  //   %fn   = load ptr, ptr %vfn_slot          (VTableEntryLoad)
+  //   %vfn_slot = GEP ptr %vtable, i64 N        (VTableEntryPtr, VTableOffset)
+  //   %vtable   = load ptr, ptr %obj            (VTablePtrLoad)
+  //   %obj      = ... (alloca or argument)
   LoadInst *VTableEntryLoad = dyn_cast<LoadInst>(Callee);
   if (!VTableEntryLoad)
     return false;
@@ -813,116 +819,46 @@ bool llvm::tryPromoteCall(CallBase &CB) {
   Value *ObjectBase = Object->stripAndAccumulateConstantOffsets(
       DL, ObjectOffset, /* AllowNonInbounds */ true);
 
-  dbgs() << "  tryPromoteCall: ObjectBase = " << *ObjectBase << "\n";
-  dbgs() << "    is AllocaInst: " << isa<AllocaInst>(ObjectBase) << "\n";
-  dbgs() << "    is Argument: " << isa<Argument>(ObjectBase) << "\n";
-
-  // MODIFIED: Check offset first
   if (ObjectOffset != 0)
     return false;
 
-  // MODIFIED: Allow both AllocaInst and Argument
-  Value *VTablePtr = nullptr;
-
   if (isa<AllocaInst>(ObjectBase)) {
-    // Original alloca path - look for vtable store in this function
-    dbgs() << "    Object is alloca, looking for vtable store\n";
+    // The object lives on the stack.  Look for a dominating store of a concrete
+    // vtable pointer to the vptr field; this is set by the copy/move constructor
+    // when the object was materialised locally (e.g. "Impl copy = *ptr").
     BasicBlock::iterator BBI(VTablePtrLoad);
-    VTablePtr = FindAvailableLoadedValue(
+    Value *VTablePtr = FindAvailableLoadedValue(
         VTablePtrLoad, VTablePtrLoad->getParent(), BBI, 0, nullptr, nullptr);
     if (!VTablePtr || !VTablePtr->getType()->isPointerTy())
       return false;
-  } else if (isa<Argument>(ObjectBase)) {
-    errs()
-        << "    Object is argument, attempting type-based devirtualization\n";
 
-    Argument *Arg = cast<Argument>(ObjectBase);
-
-    // Get debug type information for this argument
-    DIType *ArgDIType = getArgumentDIType(Arg);
-    if (!ArgDIType) {
-      errs() << "      No debug type information available\n";
+    APInt VTableOffsetGVBase(DL.getIndexTypeSizeInBits(VTablePtr->getType()),
+                             0);
+    Value *VTableGVBase = VTablePtr->stripAndAccumulateConstantOffsets(
+        DL, VTableOffsetGVBase, /* AllowNonInbounds */ true);
+    GlobalVariable *GV = dyn_cast<GlobalVariable>(VTableGVBase);
+    if (!(GV && GV->isConstant() && GV->hasDefinitiveInitializer()))
       return false;
-    }
 
-    // Get the underlying class/struct type
-    DICompositeType *ClassType = getUnderlyingCompositeType(ArgDIType);
-    if (!ClassType) {
-      errs() << "      Argument is not a class/struct type\n";
+    APInt VTableGVOffset = VTableOffsetGVBase + VTableOffset;
+    if (VTableGVOffset.getActiveBits() > 64)
       return false;
-    }
 
-    errs() << "      Class type: " << ClassType->getName() << "\n";
-
-    // Check if it's a final class (for safety)
-    // NOTE: For now, we proceed even if not marked final
-    // In production, you might want to require this
-    // bool IsFinal = isClassFinal(ClassType);
-    // errs() << "      Is final: " << (IsFinal ? "yes" : "no") << "\n";
-
-    // Get the vtable name
-    std::string VTableName = getVTableNameFromDIType(ClassType);
-    if (VTableName.empty()) {
-      errs() << "      Could not determine vtable name\n";
+    auto [DirectCallee, DirectCalleePtr] =
+        getFunctionAtVTableOffset(GV, VTableGVOffset.getZExtValue(), *M);
+    if (!DirectCallee || !isLegalToPromote(CB, DirectCallee))
       return false;
-    }
 
-    errs() << "      Looking for vtable: " << VTableName << "\n";
-
-    GlobalVariable *TypeVTable = M->getGlobalVariable(VTableName);
-    if (!TypeVTable) {
-      errs() << "      Vtable not found\n";
-      return false;
-    }
-
-    errs() << "      Found vtable: " << TypeVTable->getName() << "\n";
-
-    if (!TypeVTable->isConstant() || !TypeVTable->hasDefinitiveInitializer()) {
-      errs() << "      Vtable is not constant or has no initializer\n";
-      return false;
-    }
-
-    // Create pointer to vtable entry
-    Type *VTableType = TypeVTable->getValueType();
-    Constant *Indices[] = {
-        ConstantInt::get(Type::getInt64Ty(M->getContext()), 0),
-        ConstantInt::get(Type::getInt32Ty(M->getContext()), 0),
-        ConstantInt::get(Type::getInt32Ty(M->getContext()), 2)};
-
-    VTablePtr =
-        ConstantExpr::getInBoundsGetElementPtr(VTableType, TypeVTable, Indices);
-
-    errs() << "      VTablePtr: " << *VTablePtr << "\n";
-
-  } else {
-    // Neither alloca nor argument
-    dbgs() << "    Object is neither alloca nor argument, bailing out\n";
-    return false;
+    promoteCall(CB, DirectCallee);
+    return true;
   }
 
-  // Rest unchanged...
-  APInt VTableOffsetGVBase(DL.getIndexTypeSizeInBits(VTablePtr->getType()), 0);
-  Value *VTableGVBase = VTablePtr->stripAndAccumulateConstantOffsets(
-      DL, VTableOffsetGVBase, /* AllowNonInbounds */ true);
-  GlobalVariable *GV = dyn_cast<GlobalVariable>(VTableGVBase);
-  if (!(GV && GV->isConstant() && GV->hasDefinitiveInitializer()))
-    return false;
-
-  APInt VTableGVOffset = VTableOffsetGVBase + VTableOffset;
-  if (!(VTableGVOffset.getActiveBits() <= 64))
-    return false;
-
-  Function *DirectCallee = nullptr;
-  std::tie(DirectCallee, std::ignore) =
-      getFunctionAtVTableOffset(GV, VTableGVOffset.getZExtValue(), *M);
-  if (!DirectCallee)
-    return false;
-
-  if (!isLegalToPromote(CB, DirectCallee))
-    return false;
-
-  promoteCall(CB, DirectCallee);
-  return true;
+  // For objects whose address comes from outside the function (e.g. a pointer
+  // argument), look for a dominating
+  //   llvm.assume(llvm.type.test(Object, type_id))
+  // that was emitted by Clang at a static_cast<Derived*> downcast site.  That
+  // assume records the programmer's assertion about the dynamic type.
+  return tryDevirtualizeViaTypeTest(CB, Object, VTableOffset, DL, *M);
 }
 
 #undef DEBUG_TYPE
