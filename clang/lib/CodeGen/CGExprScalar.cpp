@@ -2748,8 +2748,9 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
     // type.test argument so that tryPromoteCall can find it immediately after
     // inlining the callee: after inlining, the vtable is loaded from the same
     // SSA value (the original object pointer), making the type.test findable by
-    // scanning uses of the object pointer without needing GVN first.
-    if (DerivedClassDecl->isPolymorphic()) {
+    // scanning uses of the object pointer.
+    if (DerivedClassDecl->isPolymorphic() &&
+        DerivedClassDecl->isEffectivelyFinal()) {
       llvm::Value *BasePtr = Base.emitRawPointer(CGF);
       CanQualType Ty = CGF.CGM.getContext().getCanonicalTagType(DerivedClassDecl);
       llvm::Metadata *MD = CGF.CGM.CreateMetadataIdentifierForType(Ty);

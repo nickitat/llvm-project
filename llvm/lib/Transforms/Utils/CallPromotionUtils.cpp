@@ -726,6 +726,12 @@ static bool tryDevirtualizeViaTypeTestAssume(CallBase &CB, Value *Object,
         cast<MetadataAsValue>(TypeTestCI->getArgOperand(1))->getMetadata();
 
     // Vtable lookup via !type metadata.
+    // We require exactly one matching vtable — if multiple vtables carry the
+    // same type ID the type is not effectively final and we cannot safely
+    // devirtualize (the object could be a further-derived subclass).
+    GlobalVariable *MatchedVTable = nullptr;
+    uint64_t MatchedAddrPointOffset = 0;
+    bool Ambiguous = false;
     for (GlobalVariable &GV : M.globals()) {
       if (!GV.isConstant() || !GV.hasDefinitiveInitializer())
         continue;
@@ -736,21 +742,31 @@ static bool tryDevirtualizeViaTypeTestAssume(CallBase &CB, Value *Object,
           continue;
         if (TypeMD->getOperand(1).get() != TypeId)
           continue;
-        // Metadata operand 0 is the byte offset of the address point within GV.
         auto *OffsetCmd =
             dyn_cast<ConstantAsMetadata>(TypeMD->getOperand(0));
         if (!OffsetCmd)
           continue;
-        uint64_t AddrPointOffset =
-            cast<ConstantInt>(OffsetCmd->getValue())->getZExtValue();
-        if (VTableOffset.getActiveBits() > 64)
-          continue;
-        uint64_t TotalOffset = AddrPointOffset + VTableOffset.getZExtValue();
-        auto [DirectCallee, _] = getFunctionAtVTableOffset(&GV, TotalOffset, M);
-        if (DirectCallee && isLegalToPromote(CB, DirectCallee)) {
-          promoteCall(CB, DirectCallee);
-          return true;
+        if (MatchedVTable) {
+          Ambiguous = true;
+          break;
         }
+        MatchedVTable = &GV;
+        MatchedAddrPointOffset =
+            cast<ConstantInt>(OffsetCmd->getValue())->getZExtValue();
+      }
+      if (Ambiguous)
+        break;
+    }
+    if (MatchedVTable && !Ambiguous) {
+      if (VTableOffset.getActiveBits() > 64)
+        continue;
+      uint64_t TotalOffset =
+          MatchedAddrPointOffset + VTableOffset.getZExtValue();
+      auto [DirectCallee, _] =
+          getFunctionAtVTableOffset(MatchedVTable, TotalOffset, M);
+      if (DirectCallee && isLegalToPromote(CB, DirectCallee)) {
+        promoteCall(CB, DirectCallee);
+        return true;
       }
     }
   }

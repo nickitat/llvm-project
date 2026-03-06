@@ -2,9 +2,9 @@
 //
 // Test that Clang emits llvm.type.test+llvm.assume on the object pointer at
 // CK_BaseToDerived (static_cast<Derived*>) cast sites when the derived class
-// is polymorphic. This annotation allows the LLVM inliner (tryPromoteCall) to
-// devirtualize virtual calls through the downcast pointer without requiring a
-// visible vtable store.
+// is polymorphic and effectively final. This annotation allows the LLVM inliner
+// (tryPromoteCall) to devirtualize virtual calls through the downcast pointer
+// without requiring a visible vtable store.
 
 struct Base {
   virtual void doFoo();
@@ -15,7 +15,7 @@ struct Derived final : Base {
   void doFoo() override;
 };
 
-// static_cast to a polymorphic derived class: type.test must be emitted.
+// static_cast to a final polymorphic derived class: type.test must be emitted.
 void f(Base *b) {
   static_cast<Derived *>(b)->foo();
 }
@@ -36,3 +36,17 @@ NonPolyDerived *g(NonPolyBase *b) {
 // CHECK-LABEL: define {{.*}} @_Z1gP11NonPolyBase(
 // CHECK-NOT:     llvm.type.test
 // CHECK:         ret ptr
+
+struct NonFinalDerived : Base {
+  void doFoo() override;
+};
+
+// static_cast to a non-final polymorphic derived class: no type.test should be
+// emitted (the object could be a further-derived subclass with a different vtable).
+void h(Base *b) {
+  static_cast<NonFinalDerived *>(b)->foo();
+}
+
+// CHECK-LABEL: define {{.*}} @_Z1hP4Base(
+// CHECK-NOT:     llvm.type.test
+// CHECK:         ret void
