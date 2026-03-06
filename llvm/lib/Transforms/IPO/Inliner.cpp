@@ -259,7 +259,7 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
     // Instead we should do an actual RPO walk of the function body.
     for (Instruction &I : instructions(N.getFunction()))
       if (auto *CB = dyn_cast<CallBase>(&I))
-        if (Function *Callee = CB->getCalledFunction()) { // nullptr will be returned here for our (perceived as) indirect call
+        if (Function *Callee = CB->getCalledFunction()) {
           if (!Callee->isDeclaration())
             Calls.push_back({CB, -1});
           else if (!isa<IntrinsicInst>(I)) {
@@ -333,8 +333,6 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
       const int InlineHistoryID = P.second;
       Function &Callee = *CB->getCalledFunction();
 
-      dbgs() << "  Considering call to: " << Callee.getName() << "\n";
-
       if (InlineHistoryID != -1 &&
           inlineHistoryIncludes(&Callee, InlineHistoryID, InlineHistory)) {
         LLVM_DEBUG(dbgs() << "Skipping inlining due to history: " << F.getName()
@@ -364,14 +362,10 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
           Advisor.getAdvice(*CB, OnlyMandatory);
 
       // Check whether we want to inline this callsite.
-      if (!Advice) {
-        dbgs() << "__PRETTY_FUNCTION__: " << __PRETTY_FUNCTION__
-               << " __LINE__:" << __LINE__ << "\n";
+      if (!Advice)
         continue;
-      }
 
       if (!Advice->isInliningRecommended()) {
-        dbgs() << __PRETTY_FUNCTION__ << ":" << __LINE__ << "\n";
         Advice->recordUnattemptedInlining();
         continue;
       }
@@ -393,8 +387,6 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
           &FAM.getResult<AAManager>(*CB->getCaller()), true, nullptr,
           &FAM.getResult<OptimizationRemarkEmitterAnalysis>(*CB->getCaller()));
       if (!IR.isSuccess()) {
-        dbgs() << "__PRETTY_FUNCTION__: " << __PRETTY_FUNCTION__
-               << " __LINE__:" << __LINE__ << "\n";
         Advice->recordUnsuccessfulInlining(IR);
         continue;
       }
@@ -423,12 +415,8 @@ PreservedAnalyses InlinerPass::run(LazyCallGraph::SCC &InitialC,
             // the post-inline cleanup and the next DevirtSCCRepeatedPass
             // iteration because the next iteration may not happen and we may
             // miss inlining it.
-            if (tryPromoteCall(*ICB)) {
-              dbgs() << "    Promoted indirect call site after inlining:" << *ICB << "\n";
+            if (tryPromoteCall(*ICB))
               NewCallee = ICB->getCalledFunction();
-            } else {
-              dbgs() << "    Indirect call site remains after inlining:" << *ICB << "\n";
-            }
           }
           if (NewCallee) {
             if (!NewCallee->isDeclaration()) {

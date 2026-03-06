@@ -683,26 +683,21 @@ CallBase &llvm::promoteCallWithVTableCmp(CallBase &CB, Instruction *VPtr,
   return promoteCall(NewInst, Callee);
 }
 
-// Try to devirtualize an indirect virtual call using llvm.type.test + llvm.assume
-// pairs that were emitted by Clang at static_cast<Derived*> downcast sites.
-//
-// The idea: static_cast<Derived*>(base) is a programmer assertion (UB if wrong)
-// that the object is of type Derived. Clang records this as:
+// Try to devirtualize an indirect virtual call using
+// llvm.type.test + llvm.assume pairs that were emitted by Clang,
+// e.g., at static_cast<Derived*> downcast sites.
+// Such a cast is a programmer assertion (UB if wrong) that the object is of
+// type Derived. Clang records this as:
 //   %tt = call i1 @llvm.type.test(ptr %base_obj, metadata !"_ZTS4Derived")
 //   call void @llvm.assume(i1 %tt)
 //
 // After the callee is inlined into the caller, the vtable is loaded from the
 // same object pointer (%base_obj). By scanning uses of Object (the vtable-load
 // source) for such type.test calls, we can determine the concrete vtable and
-// resolve the virtual call to a direct call — without needing GVN first.
-//
-// For the vtable lookup we prefer the precise offset from !type metadata on the
-// vtable global. When that metadata is absent we fall back to the Itanium ABI
-// convention: the vptr address-point is 2 pointers (16 bytes on 64-bit) past
-// the start of the vtable global.
-static bool tryDevirtualizeViaTypeTest(CallBase &CB, Value *Object,
-                                       APInt VTableOffset,
-                                       const DataLayout &DL, Module &M) {
+// resolve the virtual call to a direct call.
+static bool tryDevirtualizeViaTypeTestAssume(CallBase &CB, Value *Object,
+                                             APInt VTableOffset,
+                                             const DataLayout &DL, Module &M) {
   // Build a dominator tree so we can verify the assume dominates the call.
   DominatorTree DT(*CB.getFunction());
 
@@ -730,9 +725,7 @@ static bool tryDevirtualizeViaTypeTest(CallBase &CB, Value *Object,
     Metadata *TypeId =
         cast<MetadataAsValue>(TypeTestCI->getArgOperand(1))->getMetadata();
 
-    // --- Vtable lookup via !type metadata (preferred) ---
-    // If the vtable global has !type metadata we can get the precise
-    // address-point offset, which is needed for the total offset computation.
+    // Vtable lookup via !type metadata.
     for (GlobalVariable &GV : M.globals()) {
       if (!GV.isConstant() || !GV.hasDefinitiveInitializer())
         continue;
@@ -753,39 +746,12 @@ static bool tryDevirtualizeViaTypeTest(CallBase &CB, Value *Object,
         if (VTableOffset.getActiveBits() > 64)
           continue;
         uint64_t TotalOffset = AddrPointOffset + VTableOffset.getZExtValue();
-        auto [DirectCallee, DirectCalleePtr] =
-            getFunctionAtVTableOffset(&GV, TotalOffset, M);
+        auto [DirectCallee, _] = getFunctionAtVTableOffset(&GV, TotalOffset, M);
         if (DirectCallee && isLegalToPromote(CB, DirectCallee)) {
           promoteCall(CB, DirectCallee);
           return true;
         }
       }
-    }
-
-    // --- Fallback: Itanium ABI name construction ---
-    // For "_ZTS4Impl" -> "_ZTV4Impl" (replace _ZTS prefix with _ZTV).
-    // The vptr address-point is assumed to be 2 pointers past the global start.
-    auto *MDStr = dyn_cast<MDString>(TypeId);
-    if (!MDStr)
-      continue;
-    StringRef TypeIdStr = MDStr->getString();
-    if (!TypeIdStr.starts_with("_ZTS"))
-      continue;
-    std::string VTableName = "_ZTV" + TypeIdStr.substr(4).str();
-    GlobalVariable *VTableGV = M.getGlobalVariable(VTableName);
-    if (!VTableGV || !VTableGV->isConstant() ||
-        !VTableGV->hasDefinitiveInitializer())
-      continue;
-    // Itanium ABI: vptr -> &vtable[2] (past offset-to-top and RTTI pointer).
-    uint64_t AddrPointOffset = 2 * DL.getPointerSize();
-    if (VTableOffset.getActiveBits() > 64)
-      continue;
-    uint64_t TotalOffset = AddrPointOffset + VTableOffset.getZExtValue();
-    auto [DirectCallee, DirectCalleePtr] =
-        getFunctionAtVTableOffset(VTableGV, TotalOffset, M);
-    if (DirectCallee && isLegalToPromote(CB, DirectCallee)) {
-      promoteCall(CB, DirectCallee);
-      return true;
     }
   }
   return false;
@@ -798,12 +764,12 @@ bool llvm::tryPromoteCall(CallBase &CB) {
   Value *Callee = CB.getCalledOperand();
 
   // We expect the indirect callee to be a function pointer loaded from a vtable
-  // slot, which is itself a GEP into the vtable, which is loaded from the
-  // object's vptr field.  The chain is:
-  //   %fn   = load ptr, ptr %vfn_slot          (VTableEntryLoad)
-  //   %vfn_slot = GEP ptr %vtable, i64 N        (VTableEntryPtr, VTableOffset)
-  //   %vtable   = load ptr, ptr %obj            (VTablePtrLoad)
+  // slot, which is itself a getelementptr into the vtable, which is loaded from
+  // the object's vptr field.  The chain is:
   //   %obj      = ... (alloca or argument)
+  //   %vtable   = load ptr, ptr %obj            (VTablePtrLoad)
+  //   %vfn_slot = GEP ptr %vtable, i64 N        (VTableEntryPtr, VTableOffset)
+  //   %fn       = load ptr, ptr %vfn_slot       (VTableEntryLoad)
   LoadInst *VTableEntryLoad = dyn_cast<LoadInst>(Callee);
   if (!VTableEntryLoad)
     return false;
@@ -823,9 +789,9 @@ bool llvm::tryPromoteCall(CallBase &CB) {
     return false;
 
   if (isa<AllocaInst>(ObjectBase)) {
-    // The object lives on the stack.  Look for a dominating store of a concrete
-    // vtable pointer to the vptr field; this is set by the copy/move constructor
-    // when the object was materialised locally (e.g. "Impl copy = *ptr").
+    // Look for a store of a concrete vtable pointer to the vptr field;
+    // this is set by the copy/move constructor when the object was materialised
+    // locally.
     BasicBlock::iterator BBI(VTablePtrLoad);
     Value *VTablePtr = FindAvailableLoadedValue(
         VTablePtrLoad, VTablePtrLoad->getParent(), BBI, 0, nullptr, nullptr);
@@ -844,7 +810,7 @@ bool llvm::tryPromoteCall(CallBase &CB) {
     if (VTableGVOffset.getActiveBits() > 64)
       return false;
 
-    auto [DirectCallee, DirectCalleePtr] =
+    auto [DirectCallee, _] =
         getFunctionAtVTableOffset(GV, VTableGVOffset.getZExtValue(), *M);
     if (!DirectCallee || !isLegalToPromote(CB, DirectCallee))
       return false;
@@ -852,13 +818,7 @@ bool llvm::tryPromoteCall(CallBase &CB) {
     promoteCall(CB, DirectCallee);
     return true;
   }
-
-  // For objects whose address comes from outside the function (e.g. a pointer
-  // argument), look for a dominating
-  //   llvm.assume(llvm.type.test(Object, type_id))
-  // that was emitted by Clang at a static_cast<Derived*> downcast site.  That
-  // assume records the programmer's assertion about the dynamic type.
-  return tryDevirtualizeViaTypeTest(CB, Object, VTableOffset, DL, *M);
+  return tryDevirtualizeViaTypeTestAssume(CB, Object, VTableOffset, DL, *M);
 }
 
 #undef DEBUG_TYPE
