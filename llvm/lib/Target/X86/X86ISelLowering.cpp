@@ -60034,6 +60034,44 @@ static SDValue combineSub(SDNode *N, SelectionDAG &DAG,
                                                      /*AllowOpaques*/ false);
   };
 
+  // Predicate a masked increment so it stays in the mask (k) register:
+  //   sub(Y, sext(vXi1 M))  ->  vselect(M, add(Y, 1), Y)
+  // The combineAdd fold turns (add (zext (vXi1 M)), Y) into this sub form; here
+  // we keep it predicated for loop-carried accumulators, where it selects to a
+  // single masked add/sub (vpsubd {k}) with a loop-invariant addend, instead of
+  // materializing the mask as a 0/-1 vector (vpmovm2d) and running an unmasked
+  // vpsubd every iteration.
+  //
+  // Restrict this to values that are copied out to a virtual register (a
+  // loop-carried or live-out value), where the addend hoists and the masked
+  // form's passthru is free. For straight-line, single-use, or ABI-boundary
+  // values (results copied to a physical/return register) the plain
+  // (sub Y, sext) form is preferred, as the predicated form would cost an extra
+  // blend or copy.
+  if (VT.isVector()) {
+    EVT BoolVT = EVT::getVectorVT(*DAG.getContext(), MVT::i1,
+                                  VT.getVectorElementCount());
+    if (DAG.getTargetLoweringInfo().isTypeLegal(BoolVT) &&
+        Op1.getOpcode() == ISD::SIGN_EXTEND && Op1.hasOneUse() &&
+        Op1.getOperand(0).getValueType() == BoolVT) {
+      bool LiveOutToVReg = false;
+      for (SDNode *U : N->users()) {
+        if (U->getOpcode() != ISD::CopyToReg)
+          continue;
+        if (auto *R = dyn_cast<RegisterSDNode>(U->getOperand(1)))
+          if (R->getReg().isVirtual()) {
+            LiveOutToVReg = true;
+            break;
+          }
+      }
+      if (LiveOutToVReg) {
+        SDValue Inc =
+            DAG.getNode(ISD::ADD, DL, VT, Op0, DAG.getConstant(1, DL, VT));
+        return DAG.getNode(ISD::VSELECT, DL, VT, Op1.getOperand(0), Inc, Op0);
+      }
+    }
+  }
+
   // X86 can't encode an immediate LHS of a sub. See if we can push the
   // negation into a preceding instruction. If the RHS of the sub is a XOR with
   // one use and a constant, invert the immediate, saving one register.
