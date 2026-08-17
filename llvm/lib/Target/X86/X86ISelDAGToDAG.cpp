@@ -2832,8 +2832,7 @@ bool X86DAGToDAGISel::matchAddressRecursively(SDValue N, X86ISelAddressMode &AM,
     //                   shlq $2, %rsi            leaq (%rdi,%rsi,4), %rax
     //                   subq %rsi, %rax
     //
-    // That pays for the negate, so drop the cost by one to reach the same
-    // accept-if-not-worse threshold the plain A-B fold uses.
+    // That pays for the negate, so drop the cost by one.
     unsigned NegScale = 1;
     if (RHS.getOpcode() == ISD::SHL && RHS.hasOneUse()) {
       if (auto *ShAmt = dyn_cast<ConstantSDNode>(RHS.getOperand(1))) {
@@ -2861,14 +2860,7 @@ bool X86DAGToDAGISel::matchAddressRecursively(SDValue N, X86ISelAddressMode &AM,
     // The general test, which is a prediction rather than a known cost:
     // SelectionDAG is per-block, so uses elsewhere are invisible, and another
     // use in this block may well be scheduled before the NEG. It is not applied
-    // to a folded shift, where it is wrong often enough to matter - in
-    // x + -4*y, the reported case, y is a single-use argument the NEG clobbers
-    // for free. The stakes are symmetric, one instruction either way, so this
-    // is settled by measurement: over 240 modules of LLVM's own source,
-    // applying it to folded shifts as well folds three fewer sites for two more
-    // instructions, and leaves the reported case alone. A truncate or extend is
-    // charged either way - it aliases a wider value, so clobbering it clobbers
-    // something whose uses this node's count does not report.
+    // to a folded shift, where it is wrong often enough to matter.
     if ((NegScale == 1 && (!RHS.getNode()->hasOneUse() ||
                            RHS.getNode()->getOpcode() == ISD::CopyFromReg)) ||
         RHS.getNode()->getOpcode() == ISD::TRUNCATE ||
