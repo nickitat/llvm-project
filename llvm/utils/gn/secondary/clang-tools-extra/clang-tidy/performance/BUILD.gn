@@ -17,6 +17,7 @@ static_library("performance") {
     "EnumSizeCheck.cpp",
     "ExpensiveValueOrCheck.cpp",
     "ForRangeCopyCheck.cpp",
+    "ImplicitConditionalOperandCopyCheck.cpp",
     "ImplicitConversionInLoopCheck.cpp",
     "InefficientAlgorithmCheck.cpp",
     "InefficientStringConcatenationCheck.cpp",

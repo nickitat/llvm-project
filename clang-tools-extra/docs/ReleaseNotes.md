@@ -124,6 +124,13 @@ infrastructure are described first, followed by tool-specific sections.
   Finds calls to `value_or` (and alternative spellings `valueOr`,
   `ValueOr`) on optional types where the return type is expensive to copy.
 
+- New {doc}`performance-implicit-conditional-operand-copy
+  <clang-tidy/checks/performance/implicit-conditional-operand-copy>` check.
+
+  Finds conditional operators that implicitly copy one of their operands
+  because the other operand is a temporary, where the result is used only as a
+  `const` object and the copy can therefore be dropped.
+
 - New {doc}`portability-avoid-pragma-comment
   <clang-tidy/checks/portability/avoid-pragma-comment>` check.
 

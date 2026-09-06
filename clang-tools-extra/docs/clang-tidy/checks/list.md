@@ -356,6 +356,7 @@ readability/*
 | {doc}`performance-enum-size <performance/enum-size>` |  |
 | {doc}`performance-expensive-value-or <performance/expensive-value-or>` | Yes |
 | {doc}`performance-for-range-copy <performance/for-range-copy>` | Yes |
+| {doc}`performance-implicit-conditional-operand-copy <performance/implicit-conditional-operand-copy>` |  |
 | {doc}`performance-implicit-conversion-in-loop <performance/implicit-conversion-in-loop>` |  |
 | {doc}`performance-inefficient-algorithm <performance/inefficient-algorithm>` | Yes |
 | {doc}`performance-inefficient-string-concatenation <performance/inefficient-string-concatenation>` |  |
