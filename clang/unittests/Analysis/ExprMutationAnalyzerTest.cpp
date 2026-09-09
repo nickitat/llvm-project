@@ -2540,4 +2540,62 @@ TEST(ExprMutationAnalyzerTest, PointeeMutatedByInitListElement) {
   }
 }
 
+// A prvalue used as an object, or bound to a reference, is wrapped in a
+// `MaterializeTemporaryExpr`. Whether the analysis sees one depends on how the
+// expression is reached -- `forEachArgumentWithParamType` hands over the
+// argument with the temporary stripped, while `hasObjectExpression` and
+// `hasLHS` hand over the node as it stands -- so resolving to the expression
+// has to look through it.
+TEST(ExprMutationAnalyzerTest, MaterializedTemporary) {
+  // The member is of class type so that assigning to it is well formed: a
+  // non-static data member of a prvalue is an xvalue, which a built-in
+  // assignment cannot take but an overloaded one can.
+  const std::string Class =
+      "struct M { M &operator=(const M &); };"
+      "struct S { M F; void constMethod() const; void mutate(); };"
+      "S make(); bool cond();";
+
+  // Assigning to a member of the temporary mutates it.
+  auto AST = buildASTFromCode(Class + "void f(M X) { make().F = X; }");
+  auto Results = match(withEnclosingCompound(callExpr(callee(
+                           functionDecl(hasName("make"))))),
+                       AST->getASTContext());
+  EXPECT_THAT(mutatedBy(Results, AST.get()), ElementsAre("make().F = X"));
+
+  // Calling a non-const member function on it mutates it.
+  AST = buildASTFromCode(Class + "void f() { make().mutate(); }");
+  Results = match(withEnclosingCompound(
+                      callExpr(callee(functionDecl(hasName("make"))))),
+                  AST->getASTContext());
+  EXPECT_TRUE(isMutated(Results, AST.get()));
+
+  // Calling a const member function on it does not.
+  AST = buildASTFromCode(Class + "void f() { make().constMethod(); }");
+  Results = match(withEnclosingCompound(
+                      callExpr(callee(functionDecl(hasName("make"))))),
+                  AST->getASTContext());
+  EXPECT_FALSE(isMutated(Results, AST.get()));
+
+  // The same holds when the temporary is the result of a conditional operator,
+  // where the materialization sits above the operator rather than the call.
+  AST = buildASTFromCode(Class +
+                         "void f(S S1, M X) { (cond() ? S1 : make()).F = X; }");
+  Results = match(withEnclosingCompound(conditionalOperator()),
+                  AST->getASTContext());
+  EXPECT_TRUE(isMutated(Results, AST.get()));
+
+  AST = buildASTFromCode(
+      Class + "void f(S S1) { (cond() ? S1 : make()).constMethod(); }");
+  Results = match(withEnclosingCompound(conditionalOperator()),
+                  AST->getASTContext());
+  EXPECT_FALSE(isMutated(Results, AST.get()));
+
+  // Binding it to an rvalue reference that is then mutated through mutates it.
+  AST = buildASTFromCode(Class + "void f() { S &&R = make(); R.mutate(); }");
+  Results = match(withEnclosingCompound(
+                      callExpr(callee(functionDecl(hasName("make"))))),
+                  AST->getASTContext());
+  EXPECT_TRUE(isMutated(Results, AST.get()));
+}
+
 } // namespace clang

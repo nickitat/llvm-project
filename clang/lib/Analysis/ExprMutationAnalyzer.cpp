@@ -67,7 +67,32 @@ static bool canExprResolveTo(const Expr *Source, const Expr *Target) {
     return false;
   };
 
-  const Expr *SourceExprP = Source->IgnoreParens();
+  // A prvalue that is used as an object, or bound to a reference, is wrapped
+  // in a temporary materialization. Whether one stands between the expression
+  // and its use is not something a caller can predict: `hasObjectExpression`
+  // and `hasLHS` hand over the node as it stands, while
+  // `forEachArgumentWithParamType` strips it, because `IgnoreParenCasts`
+  // looks through a `MaterializeTemporaryExpr`. Resolve through it here so
+  // that every path gives the same answer, and so that naming either node
+  // asks the same question.
+  const auto IgnoreTemporary = [](const Expr *E) {
+    while (true) {
+      if (const auto *Materialize = dyn_cast<MaterializeTemporaryExpr>(E)) {
+        E = Materialize->getSubExpr()->IgnoreParens();
+        continue;
+      }
+      // A materialization whose temporary needs destroying, or whose lifetime
+      // is extended, sits under an `ExprWithCleanups`.
+      if (const auto *Full = dyn_cast<FullExpr>(E)) {
+        E = Full->getSubExpr()->IgnoreParens();
+        continue;
+      }
+      return E;
+    }
+  };
+
+  Target = IgnoreTemporary(Target->IgnoreParens());
+  const Expr *SourceExprP = IgnoreTemporary(Source->IgnoreParens());
   return IgnoreDerivedToBase(SourceExprP,
                              [&](const Expr *E) {
                                return E == Target || ConditionalOperatorM(E);
